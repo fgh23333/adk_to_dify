@@ -1,10 +1,12 @@
 import logging
+import base64
 from contextlib import asynccontextmanager
 import httpx
-from fastapi import FastAPI, HTTPException, Request, Depends
+from fastapi import FastAPI, HTTPException, Request, Depends, UploadFile, File
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials
+from typing import Dict, Any
 
 from app.config import settings
 from app.models import (
@@ -147,6 +149,54 @@ async def list_models(
 async def health_check() -> HealthResponse:
     """Health check endpoint."""
     return HealthResponse()
+
+
+@app.post("/upload")
+async def upload_file(
+    file: UploadFile = File(...),
+    api_key: HTTPAuthorizationCredentials = Depends(verify_api_key_dependency)
+) -> Dict[str, Any]:
+    """
+    上传文件并转换为Base64格式供ADK使用
+    """
+    try:
+        from app.multimodal import MultimodalProcessor
+        processor = MultimodalProcessor()
+        
+        # 读取文件内容
+        file_content = await file.read()
+        
+        # 验证和处理文件
+        is_valid, error_msg, detected_mime = processor.validate_file(
+            file_content, file.filename, file.content_type
+        )
+        
+        if not is_valid:
+            raise HTTPException(status_code=400, detail=error_msg)
+        
+        # 转换为Base64
+        inline_data = processor.process_base64_file(
+            base64.b64encode(file_content).decode('utf-8'),
+            file.filename,
+            detected_mime
+        )
+        
+        if not inline_data:
+            raise HTTPException(status_code=500, detail="文件处理失败")
+        
+        return {
+            "success": True,
+            "filename": file.filename,
+            "mime_type": inline_data.mimeType,
+            "base64_data": inline_data.data,
+            "size": len(file_content)
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"文件上传失败: {e}")
+        raise HTTPException(status_code=500, detail=f"文件上传失败: {str(e)}")
 
 
 @app.get("/")

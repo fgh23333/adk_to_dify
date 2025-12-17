@@ -1,7 +1,8 @@
 import re
 import base64
 import mimetypes
-from typing import List, Optional, Tuple
+import magic
+from typing import List, Optional, Tuple, Union
 import httpx
 from app.config import settings
 from app.models import ContentPart, ADKPart, ADKInlineData
@@ -15,6 +16,122 @@ class MultimodalProcessor:
         self.max_file_size = settings.max_file_size_mb * 1024 * 1024  # Convert to bytes
         self.timeout = settings.download_timeout
         
+        # 支持的文件类型配置
+        self.supported_types = {
+            "images": ["image/jpeg", "image/png", "image/gif", "image/webp", "image/bmp", "image/svg+xml"],
+            "documents": [
+                "application/pdf",
+                "text/plain",
+                "application/msword",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "application/vnd.ms-excel",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                "application/vnd.ms-powerpoint",
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+            ],
+            "archives": [
+                "application/zip",
+                "application/x-rar-compressed",
+                "application/x-7z-compressed"
+            ],
+            "videos": [
+                "video/mp4",
+                "video/avi",
+                "video/mov",
+                "video/wmv",
+                "video/flv"
+            ],
+            "audio": [
+                "audio/mp3",
+                "audio/wav",
+                "audio/flac",
+                "audio/aac"
+            ]
+        }
+        
+        # 文件大小限制（字节）
+        self.file_size_limits = {
+            "image": 10 * 1024 * 1024,      # 10MB
+            "document": 20 * 1024 * 1024,   # 20MB
+            "archive": 50 * 1024 * 1024,    # 50MB
+            "video": 100 * 1024 * 1024,     # 100MB
+            "audio": 20 * 1024 * 1024       # 20MB
+        }
+        
+    def validate_file(self, file_data: bytes, filename: str, mime_type: str = None) -> Tuple[bool, str, str]:
+        """
+        验证文件类型和大小
+        Returns: (is_valid, error_message, detected_mime_type)
+        """
+        try:
+            # 检测文件大小
+            file_size = len(file_data)
+            
+            # 检测MIME类型
+            if not mime_type:
+                mime_type = magic.from_buffer(file_data, mime=True)
+            
+            # 获取所有支持的类型
+            all_supported_types = []
+            for types in self.supported_types.values():
+                all_supported_types.extend(types)
+            
+            # 检查文件类型
+            if mime_type not in all_supported_types:
+                return False, f"不支持的文件类型: {mime_type}", mime_type
+            
+            # 确定文件类别和大小限制
+            category = None
+            size_limit = self.max_file_size  # 默认限制
+            
+            for cat, types in self.supported_types.items():
+                if mime_type in types:
+                    category = cat.rstrip('s')  # 移除复数形式
+                    size_limit = self.file_size_limits.get(category, self.max_file_size)
+                    break
+            
+            # 检查文件大小
+            if file_size > size_limit:
+                size_mb = size_limit / (1024 * 1024)
+                return False, f"文件大小超过限制 ({size_mb:.1f}MB)", mime_type
+            
+            return True, "", mime_type
+            
+        except Exception as e:
+            logger.error(f"文件验证失败: {e}")
+            return False, f"文件验证失败: {str(e)}", ""
+
+    def process_base64_file(self, base64_data: str, filename: str, mime_type: str = None) -> Optional[ADKInlineData]:
+        """
+        处理Base64编码的文件数据
+        """
+        try:
+            # 解码Base64数据
+            if base64_data.startswith(f"data:{mime_type};base64,"):
+                # 移除数据URL前缀
+                base64_data = base64_data.split(",", 1)[1]
+            
+            file_data = base64.b64decode(base64_data)
+            
+            # 验证文件
+            is_valid, error_msg, detected_mime = self.validate_file(file_data, filename, mime_type)
+            
+            if not is_valid:
+                logger.error(f"文件验证失败: {error_msg}")
+                return None
+            
+            # 重新编码为Base64（确保格式正确）
+            final_base64 = base64.b64encode(file_data).decode('utf-8')
+            
+            return ADKInlineData(
+                mimeType=detected_mime,
+                data=final_base64
+            )
+            
+        except Exception as e:
+            logger.error(f"处理Base64文件失败: {e}")
+            return None
+
     async def process_content(self, content_parts: List[ContentPart]) -> Tuple[str, List[ADKPart]]:
         """
         Process content parts, extracting text and handling multimodal content.
@@ -48,16 +165,40 @@ class MultimodalProcessor:
                         
             elif part.type == "image_url" and part.image_url:
                 logger.info(f"Found image_url part: {part.image_url.url[:100]}...")
-                try:
-                    logger.info(f"Attempting to download image URL: {part.image_url.url}")
-                    inline_data = await self._download_and_convert_url(part.image_url.url)
-                    if inline_data:
-                        logger.info(f"Successfully downloaded and converted image: {inline_data.mimeType}, data length: {len(inline_data.data)}")
-                        adk_parts.append(ADKPart(inlineData=inline_data))
-                    else:
-                        logger.warning(f"Failed to download image URL: {part.image_url.url} - no data returned")
-                except Exception as e:
-                    logger.error(f"Failed to process image URL {part.image_url.url}: {e}")
+                
+                # 检查是否为Base64数据
+                if part.image_url.url.startswith("data:"):
+                    try:
+                        logger.info(f"Processing Base64 image data")
+                        # 从数据URL中提取MIME类型和Base64数据
+                        mime_type = None
+                        if ":" in part.image_url.url:
+                            mime_type = part.image_url.url.split(":")[1].split(";")[0]
+                        
+                        inline_data = self.process_base64_file(
+                            part.image_url.url, 
+                            "image", 
+                            mime_type
+                        )
+                        if inline_data:
+                            logger.info(f"Successfully processed Base64 image: {inline_data.mimeType}")
+                            adk_parts.append(ADKPart(inlineData=inline_data))
+                        else:
+                            logger.warning(f"Failed to process Base64 image data")
+                    except Exception as e:
+                        logger.error(f"Failed to process Base64 image: {e}")
+                else:
+                    # 处理URL图片
+                    try:
+                        logger.info(f"Attempting to download image URL: {part.image_url.url}")
+                        inline_data = await self._download_and_convert_url(part.image_url.url)
+                        if inline_data:
+                            logger.info(f"Successfully downloaded and converted image: {inline_data.mimeType}, data length: {len(inline_data.data)}")
+                            adk_parts.append(ADKPart(inlineData=inline_data))
+                        else:
+                            logger.warning(f"Failed to download image URL: {part.image_url.url} - no data returned")
+                    except Exception as e:
+                        logger.error(f"Failed to process image URL {part.image_url.url}: {e}")
             else:
                 logger.warning(f"Unsupported content part type: {part.type}")
         
@@ -71,9 +212,25 @@ class MultimodalProcessor:
         return combined_text, adk_parts
     
     def _extract_urls_from_text(self, text: str) -> List[str]:
-        """Extract HTTP/HTTPS URLs from text using regex."""
-        url_pattern = r'https?://[^\s<>"{}|\\^`\[\]]+'
-        urls = re.findall(url_pattern, text)
+        """Extract HTTP/HTTPS URLs and file paths from text using regex."""
+        urls = []
+        
+        # Extract HTTP/HTTPS URLs
+        http_pattern = r'https?://[^\s<>"{}|\\^`\[\]]+'
+        http_urls = re.findall(http_pattern, text)
+        urls.extend(http_urls)
+        
+        # Extract file:// URLs
+        file_pattern = r'file://[^\s<>"{}|\\^`\[\]]+'
+        file_urls = re.findall(file_pattern, text)
+        urls.extend(file_urls)
+        
+        # Extract Windows file paths (e.g., D:\folder\file.txt)
+        windows_pattern = r'[A-Za-z]:\\[^\s<>"{}|\\^`\[\]]+\.[A-Za-z0-9]+'
+        windows_paths = re.findall(windows_pattern, text)
+        urls.extend(windows_paths)
+        
+        logger.info(f"Extracted URLs: {urls}")
         return urls
     
     async def _download_and_convert_url(self, url: str) -> Optional[ADKInlineData]:
