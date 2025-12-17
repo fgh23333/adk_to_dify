@@ -12,7 +12,7 @@
     }
   ],
   "paths": {
-    "/chat/completions": {
+    "/v1/chat/completions": {
       "post": {
         "summary": "Create chat completion",
         "description": "Creates a model response for the given chat conversation. Supports text, image, and file inputs (multimodal) and streaming responses via SSE.",
@@ -67,7 +67,7 @@
         }
       }
     },
-    "/models": {
+    "/v1/models": {
       "get": {
         "summary": "List models",
         "description": "Lists the currently available models (ADK agents).",
@@ -86,7 +86,7 @@
         }
       }
     },
-    "/health": {
+    "/v1/health": {
       "get": {
         "summary": "Health Check",
         "description": "Simple endpoint to check if the middleware is running.",
