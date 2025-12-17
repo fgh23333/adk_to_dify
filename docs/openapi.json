@@ -1,0 +1,323 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "ADK Middleware API",
+    "description": "Middleware API for exposing Google ADK agents as OpenAI-compatible Chat Completion endpoints. Designed for integration with Dify.",
+    "version": "1.0.0"
+  },
+  "servers": [
+    {
+      "url": "http://localhost:8080/v1",
+      "description": "Local Middleware Server"
+    }
+  ],
+  "paths": {
+    "/chat/completions": {
+      "post": {
+        "summary": "Create chat completion",
+        "description": "Creates a model response for the given chat conversation. Supports text, image, and file inputs (multimodal) and streaming responses via SSE.",
+        "operationId": "createChatCompletion",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateChatCompletionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateChatCompletionResponse"
+                }
+              },
+              "text/event-stream": {
+                "schema": {
+                  "type": "string",
+                  "description": "Streamed chunks (SSE) following OpenAI format."
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request (e.g. invalid input, image download failed)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Server Error (e.g. ADK unreachable)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/models": {
+      "get": {
+        "summary": "List models",
+        "description": "Lists the currently available models (ADK agents).",
+        "operationId": "listModels",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListModelsResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "summary": "Health Check",
+        "description": "Simple endpoint to check if the middleware is running.",
+        "operationId": "healthCheck",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "example": "ok"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "CreateChatCompletionRequest": {
+        "type": "object",
+        "required": [
+          "model",
+          "messages"
+        ],
+        "properties": {
+          "model": {
+            "type": "string",
+            "description": "ID of the model to use. Maps to ADK 'appName'.",
+            "example": "my_agent"
+          },
+          "messages": {
+            "type": "array",
+            "description": "A list of messages comprising the conversation so far.",
+            "items": {
+              "$ref": "#/components/schemas/ChatCompletionRequestMessage"
+            }
+          },
+          "stream": {
+            "type": "boolean",
+            "description": "If set, partial message deltas will be sent.",
+            "default": false
+          },
+          "user": {
+            "type": "string",
+            "description": "A unique identifier representing your end-user. CRITICAL: Used to generate the ADK `sessionId` for context persistence.",
+            "example": "user-123456"
+          },
+          "temperature": {
+            "type": "number",
+            "nullable": true,
+            "default": 1.0
+          }
+        }
+      },
+      "ChatCompletionRequestMessage": {
+        "type": "object",
+        "required": [
+          "role",
+          "content"
+        ],
+        "properties": {
+          "role": {
+            "type": "string",
+            "enum": [
+              "user",
+              "assistant",
+              "system"
+            ],
+            "description": "The role of the messages author."
+          },
+          "content": {
+            "oneOf": [
+              {
+                "type": "string",
+                "description": "The contents of the message."
+              },
+              {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/ChatCompletionRequestMessageContentPart"
+                },
+                "description": "An array of content parts (text and images)."
+              }
+            ]
+          }
+        }
+      },
+      "ChatCompletionRequestMessageContentPart": {
+        "type": "object",
+        "required": [
+          "type"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "text",
+              "image_url"
+            ]
+          },
+          "text": {
+            "type": "string",
+            "description": "The text content."
+          },
+          "image_url": {
+            "type": "object",
+            "properties": {
+              "url": {
+                "type": "string",
+                "description": "Either a URL of the image or the base64 encoded image data."
+              }
+            }
+          }
+        }
+      },
+      "CreateChatCompletionResponse": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "object": {
+            "type": "string",
+            "example": "chat.completion"
+          },
+          "created": {
+            "type": "integer"
+          },
+          "model": {
+            "type": "string"
+          },
+          "choices": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "index": {
+                  "type": "integer"
+                },
+                "message": {
+                  "$ref": "#/components/schemas/ChatCompletionResponseMessage"
+                },
+                "finish_reason": {
+                  "type": "string",
+                  "nullable": true
+                }
+              }
+            }
+          }
+        }
+      },
+      "ChatCompletionResponseMessage": {
+        "type": "object",
+        "properties": {
+          "role": {
+            "type": "string",
+            "enum": [
+              "assistant"
+            ]
+          },
+          "content": {
+            "type": "string"
+          }
+        }
+      },
+      "ListModelsResponse": {
+        "type": "object",
+        "properties": {
+          "object": {
+            "type": "string",
+            "example": "list"
+          },
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Model"
+            }
+          }
+        }
+      },
+      "Model": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "object": {
+            "type": "string",
+            "example": "model"
+          },
+          "created": {
+            "type": "integer"
+          },
+          "owned_by": {
+            "type": "string"
+          }
+        }
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "type": "object",
+            "properties": {
+              "message": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string"
+              },
+              "param": {
+                "type": "string",
+                "nullable": true
+              },
+              "code": {
+                "type": "string",
+                "nullable": true
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

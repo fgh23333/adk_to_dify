@@ -1,0 +1,82 @@
+from fastapi import HTTPException, Security, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from typing import Optional
+from app.config import settings
+import logging
+
+logger = logging.getLogger(__name__)
+
+# Initialize HTTP Bearer security scheme
+security = HTTPBearer(auto_error=False)
+
+
+class APIKeyAuth:
+    def __init__(self):
+        self.require_api_key = settings.require_api_key
+        self.api_keys = settings.api_keys if settings.api_keys else [settings.default_api_key]
+        
+    async def verify_api_key(self, credentials: Optional[HTTPAuthorizationCredentials] = Security(security)) -> bool:
+        """
+        Verify API Key from Authorization header.
+        
+        Args:
+            credentials: HTTP Authorization credentials
+            
+        Returns:
+            bool: True if API key is valid
+            
+        Raises:
+            HTTPException: If API key is invalid or missing
+        """
+        # If API key verification is disabled, allow all requests
+        if not self.require_api_key:
+            return True
+            
+        # If no credentials provided
+        if not credentials:
+            logger.warning("Missing API key in Authorization header")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail={
+                    "error": {
+                        "message": "You didn't provide an API key. You need to provide your API key in an Authorization header using Bearer auth (i.e. Authorization: Bearer YOUR_API_KEY).",
+                        "type": "invalid_request_error",
+                        "param": None,
+                        "code": "missing_api_key"
+                    }
+                },
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        
+        # Extract API key from Bearer token
+        api_key = credentials.credentials
+        
+        # Validate API key
+        if api_key not in self.api_keys:
+            logger.warning(f"Invalid API key provided: {api_key[:10]}...")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail={
+                    "error": {
+                        "message": "Invalid API key provided.",
+                        "type": "invalid_request_error",
+                        "param": None,
+                        "code": "invalid_api_key"
+                    }
+                },
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        
+        logger.debug(f"API key validated successfully: {api_key[:10]}...")
+        return True
+
+
+# Create global auth instance
+auth = APIKeyAuth()
+
+
+async def verify_api_key_dependency(credentials: Optional[HTTPAuthorizationCredentials] = Security(security)) -> bool:
+    """
+    FastAPI dependency for API key verification.
+    """
+    return await auth.verify_api_key(credentials)

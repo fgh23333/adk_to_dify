@@ -1,0 +1,25 @@
+# Docs directory .gitignore
+
+# Ignore temporary files
+*.tmp
+*.temp
+*~
+
+# Ignore OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Ignore editor backup files
+*.bak
+*.backup
+*.swp
+*.swo
+*~
+
+# Ignore build outputs
+*.log

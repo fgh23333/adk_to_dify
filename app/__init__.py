@@ -1,0 +1,3 @@
+"""
+ADK Middleware Application Package
+"""

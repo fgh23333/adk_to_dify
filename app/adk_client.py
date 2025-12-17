@@ -1,0 +1,439 @@
+import json
+import time
+from typing import AsyncGenerator, Optional
+import httpx
+from app.config import settings
+from app.models import (
+    ChatCompletionRequest, ChatCompletionResponse, ChatCompletionResponseChoice,
+    ChatMessage, ADKRunRequest, ADKMessage, ADKPart, ListModelsResponse, ModelInfo
+)
+from app.multimodal import MultimodalProcessor
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class ADKClient:
+    def __init__(self):
+        self.adk_host = settings.adk_host
+        self.default_app_name = settings.adk_app_name
+        self.multimodal_processor = MultimodalProcessor()
+        self._session_cache = set()  # Simple cache for created sessions
+        self._content_cache = {}  # Cache to track sent content for deduplication
+        self._event_cache = set()  # Cache to track processed events for deduplication
+        
+    async def create_chat_completion(self, request: ChatCompletionRequest) -> ChatCompletionResponse:
+        """Create a non-streaming chat completion."""
+        adk_request = await self._convert_to_adk_request(request)
+        
+        # Ensure session exists before running
+        await self._ensure_session(adk_request.appName, adk_request.userId, adk_request.sessionId)
+        
+        # Log the request for debugging
+        request_data = adk_request.to_adk_format()
+        logger.info(f"Sending ADK request to {self.adk_host}/run")
+        logger.debug(f"Request data: {request_data}")
+        
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                response = await client.post(
+                    f"{self.adk_host}/run",
+                    json=request_data
+                )
+                logger.info(f"ADK response status: {response.status_code}")
+                response.raise_for_status()
+                
+                adk_response = response.json()
+                return self._convert_from_adk_response(adk_response, request.model)
+                
+        except httpx.HTTPStatusError as e:
+            logger.error(f"ADK HTTP error: {e.response.status_code} - {e.response.text}")
+            raise
+        except Exception as e:
+            logger.error(f"Error calling ADK: {e}")
+            raise
+    
+    async def create_chat_completion_stream(self, request: ChatCompletionRequest) -> AsyncGenerator[str, None]:
+        """Create a streaming chat completion using non-streaming ADK endpoint."""
+        adk_request = await self._convert_to_adk_request(request)
+        adk_request.streaming = False  # Use non-streaming endpoint
+        
+        # Ensure session exists before running
+        await self._ensure_session(adk_request.appName, adk_request.userId, adk_request.sessionId)
+        
+        # Log the request for debugging
+        request_data = adk_request.to_adk_format()
+        logger.info(f"Sending ADK request to {self.adk_host}/run (non-streaming)")
+        logger.debug(f"Request data: {request_data}")
+        
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                response = await client.post(
+                    f"{self.adk_host}/run",
+                    json=request_data
+                )
+                logger.info(f"ADK response status: {response.status_code}")
+                response.raise_for_status()
+                
+                adk_response = response.json()
+                logger.info(f"ADK response received: {type(adk_response)}")
+                
+                # Convert ADK response to OpenAI format
+                openai_response = self._convert_from_adk_response(adk_response, request.model)
+                
+                if openai_response.choices and openai_response.choices[0].message.content:
+                    content = openai_response.choices[0].message.content
+                    
+                    # Simulate streaming by sending content in chunks
+                    chunk_size = 10  # Send 10 characters at a time
+                    for i in range(0, len(content), chunk_size):
+                        chunk_content = content[i:i + chunk_size]
+                        
+                        # Create OpenAI streaming chunk
+                        chunk = {
+                            "id": f"chatcmpl-{int(time.time())}",
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": request.model,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {"content": chunk_content},
+                                    "finish_reason": None
+                                }
+                            ]
+                        }
+                        
+                        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                        
+                        # Small delay to simulate streaming
+                        import asyncio
+                        await asyncio.sleep(0.05)
+                    
+                    # Send final chunk with finish_reason
+                    final_chunk = {
+                        "id": f"chatcmpl-{int(time.time())}",
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": request.model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {},
+                                "finish_reason": "stop"
+                            }
+                        ]
+                    }
+                    
+                    yield f"data: {json.dumps(final_chunk, ensure_ascii=False)}\n\n"
+                
+                # Send final [DONE] message
+                yield "data: [DONE]\n\n"
+                
+        except httpx.HTTPStatusError as e:
+            logger.error(f"ADK HTTP error: {e.response.status_code} - {e.response.text}")
+            raise
+        except Exception as e:
+            logger.error(f"Error in ADK call: {e}")
+            raise
+    
+    async def list_models(self) -> ListModelsResponse:
+        """List available models (ADK agents)."""
+        # For now, return a default model. In a real implementation, 
+        # you might want to query ADK for available agents.
+        model = ModelInfo(
+            id=self.default_app_name,
+            created=int(time.time()),
+            owned_by="adk"
+        )
+        
+        return ListModelsResponse(data=[model])
+    
+    async def _convert_to_adk_request(self, request: ChatCompletionRequest) -> ADKRunRequest:
+        """Convert OpenAI request to ADK request format."""
+        # Extract the last user message (ADK is stateful)
+        last_message = request.messages[-1] if request.messages else None
+        
+        if not last_message or last_message.role != "user":
+            raise ValueError("Last message must be from user")
+        
+        # Generate session ID from user field
+        user_id = request.user or "anonymous"
+        session_id = f"session_{user_id}"
+        
+        # Process content (handle multimodal)
+        if isinstance(last_message.content, str):
+            # Simple text content
+            logger.info(f"Processing simple text content: {last_message.content[:100]}...")
+            adk_parts = [ADKPart(text=last_message.content)]
+        else:
+            # Multimodal content
+            logger.info(f"Processing multimodal content with {len(last_message.content)} parts")
+            for i, part in enumerate(last_message.content):
+                logger.info(f"Part {i}: type={part.type}, content={str(part)[:100]}...")
+            
+            _, adk_parts = await self.multimodal_processor.process_content(last_message.content)
+            logger.info(f"Processed into {len(adk_parts)} ADK parts")
+            for i, part in enumerate(adk_parts):
+                if part.text:
+                    logger.info(f"ADK Part {i}: text={part.text[:100]}...")
+                elif part.inlineData:
+                    logger.info(f"ADK Part {i}: inlineData mimeType={part.inlineData.mimeType}, dataLength={len(part.inlineData.data)}")
+                else:
+                    logger.info(f"ADK Part {i}: {part}")
+        
+        # Create ADK message
+        adk_message = ADKMessage(
+            role="user",
+            parts=adk_parts
+        )
+        
+        # Create ADK request - try different possible formats
+        adk_request = ADKRunRequest(
+            appName=request.model or self.default_app_name,
+            userId=user_id,
+            sessionId=session_id,
+            streaming=request.stream,
+            newMessage=adk_message
+        )
+        
+        return adk_request
+    
+    def _convert_from_adk_response(self, adk_response, model: str) -> ChatCompletionResponse:
+        """Convert ADK response to OpenAI response format."""
+        logger.info(f"Converting ADK response of type: {type(adk_response)}")
+        
+        # Handle list response (ADK may return a list of responses)
+        if isinstance(adk_response, list):
+            logger.info(f"ADK returned list with {len(adk_response)} items")
+            if not adk_response:
+                content = ""
+            else:
+                # Take the last response from the list (most complete)
+                last_response = adk_response[-1]
+                logger.info(f"Using last response: {type(last_response)}")
+                return self._convert_from_adk_response(last_response, model)
+        elif not isinstance(adk_response, dict):
+            logger.error(f"Unexpected ADK response type: {type(adk_response)}")
+            content = str(adk_response)
+        else:
+            # Extract text content from ADK response
+            content = ""
+            if "content" in adk_response and "parts" in adk_response["content"]:
+                for part in adk_response["content"]["parts"]:
+                    if "text" in part:
+                        content += part["text"]
+            else:
+                # Try to extract content from other possible structures
+                logger.warning(f"ADK response structure: {list(adk_response.keys()) if isinstance(adk_response, dict) else 'Not a dict'}")
+                # Fallback: try to find any text content
+                if isinstance(adk_response, dict):
+                    for key, value in adk_response.items():
+                        if isinstance(value, str) and len(value) > 10:
+                            content = value
+                            logger.info(f"Using content from key '{key}': {content[:100]}...")
+                            break
+        
+        logger.info(f"Final extracted content: {content[:100]}... (length: {len(content)})")
+        
+        # Create OpenAI response
+        response = ChatCompletionResponse(
+            id=f"chatcmpl-{int(time.time())}",
+            created=int(time.time()),
+            model=model,
+            choices=[
+                ChatCompletionResponseChoice(
+                    index=0,
+                    message=ChatMessage(role="assistant", content=content),
+                    finish_reason="stop"
+                )
+            ]
+        )
+        
+        return response
+    
+    def _create_event_fingerprint(self, adk_event: dict) -> str:
+        """Create a unique fingerprint for an ADK event to detect duplicates."""
+        try:
+            # Use event ID if available
+            if "id" in adk_event and adk_event["id"]:
+                return f"id:{adk_event['id']}"
+            
+            # Otherwise use content hash
+            content = ""
+            if "content" in adk_event and "parts" in adk_event["content"]:
+                for part in adk_event["content"]["parts"]:
+                    if "text" in part:
+                        content += part["text"]
+            
+            if content:
+                # Use hash of content for fingerprint
+                import hashlib
+                return f"content:{hashlib.md5(content.encode()).hexdigest()}"
+            
+            # Fallback to full event hash
+            import hashlib
+            event_str = json.dumps(adk_event, sort_keys=True)
+            return f"event:{hashlib.md5(event_str.encode()).hexdigest()}"
+            
+        except Exception:
+            # Last resort: use string representation
+            return str(adk_event)
+
+    def _has_significant_overlap(self, content1: str, content2: str, min_overlap: int = 10) -> bool:
+        """Check if two content strings have significant overlap."""
+        if not content1 or not content2:
+            return False
+        
+        # Find the longest common substring
+        max_overlap = 0
+        len1, len2 = len(content1), len(content2)
+        
+        # Check for overlap at different positions
+        for i in range(min(len1, len2)):
+            if content1[:i] == content2[-i:]:
+                max_overlap = max(max_overlap, i)
+            if content1[-i:] == content2[:i]:
+                max_overlap = max(max_overlap, i)
+        
+        return max_overlap >= min_overlap
+    
+    def _extract_new_content(self, current: str, previous: str) -> str:
+        """Extract only the new part of content when there's overlap."""
+        if not previous:
+            return current
+        
+        # Try to find where previous content appears in current
+        if previous in current:
+            return current[len(previous):]
+        
+        # Try to find overlap at the end
+        max_overlap = 0
+        overlap_pos = 0
+        len_prev, len_curr = len(previous), len(current)
+        
+        for i in range(1, min(len_prev, len_curr) + 1):
+            if previous[-i:] == current[:i]:
+                max_overlap = i
+                overlap_pos = i
+        
+        if max_overlap > 0:
+            return current[overlap_pos:]
+        
+        # No clear overlap, return current
+        return current
+
+    def _extract_content_key(self, adk_event: dict) -> str:
+        """Extract a unique key from ADK event based on content."""
+        try:
+            content = ""
+            if "content" in adk_event and "parts" in adk_event["content"]:
+                for part in adk_event["content"]["parts"]:
+                    if "text" in part:
+                        content += part["text"]
+            return content
+        except Exception:
+            return str(adk_event)
+    
+    def _convert_adk_event_to_openai_chunk(self, adk_event: dict, model: str, request_key: str) -> Optional[str]:
+        """Convert ADK SSE event to OpenAI chunk format."""
+        try:
+            # Extract content from ADK event
+            content = ""
+            if "content" in adk_event and "parts" in adk_event["content"]:
+                for part in adk_event["content"]["parts"]:
+                    if "text" in part:
+                        content += part["text"]
+            
+            if not content:
+                return None
+            
+            # Log content for debugging
+            logger.info(f"EXTRACTED CONTENT: {content[:100]}... (length: {len(content)})")
+            
+            # Get previous content for this request
+            previous_content = self._content_cache.get(request_key, "")
+            
+            logger.info(f"PREVIOUS CONTENT: {previous_content[:100]}... (length: {len(previous_content)})")
+            logger.info(f"CONTENT COMPARISON: current==previous? {content == previous_content}")
+            
+            # Simple and robust deduplication logic
+            new_content = ""
+            
+            if not previous_content:
+                # First message, send full content
+                new_content = content
+                logger.info(f"FIRST MESSAGE: sending {len(content)} chars")
+            elif content == previous_content:
+                # Exact duplicate, skip entirely
+                logger.warning(f"*** DUPLICATE - SKIPPING {len(content)} chars ***")
+                return None
+            elif content.startswith(previous_content):
+                # Normal extension, send only the new part
+                new_content = content[len(previous_content):]
+                logger.info(f"EXTENSION: sending {len(new_content)} new chars (total: {len(content)})")
+            elif len(content) < len(previous_content) * 0.8:
+                # Likely a fragment or old message, skip
+                logger.warning(f"*** FRAGMENT/OLD - SKIPPING {len(content)} chars (previous: {len(previous_content)}) ***")
+                return None
+            else:
+                # Content reset or different format, send full content
+                new_content = content
+                logger.warning(f"*** RESET - sending full content {len(content)} chars ***")
+            
+            # Update cache with current complete content
+            self._content_cache[request_key] = content
+            
+            if not new_content.strip():
+                # No new content to send
+                return None
+            
+            # Create OpenAI chunk with only the new content
+            chunk = {
+                "id": f"chatcmpl-{int(time.time())}",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": new_content},
+                        "finish_reason": None
+                    }
+                ]
+            }
+            
+            return json.dumps(chunk, ensure_ascii=False)
+            
+        except Exception as e:
+            logger.error(f"Error converting ADK event to OpenAI chunk: {e}")
+            return None
+    
+    async def _ensure_session(self, app_name: str, user_id: str, session_id: str):
+        """Ensure session exists before running agent."""
+        session_key = f"{app_name}:{user_id}:{session_id}"
+        
+        if session_key in self._session_cache:
+            return
+        
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                # Create session using ADK API
+                response = await client.post(
+                    f"{self.adk_host}/apps/{app_name}/users/{user_id}/sessions",
+                    json={"sessionId": session_id}
+                )
+                
+                if response.status_code in [200, 201]:
+                    logger.info(f"Created ADK session: {session_id}")
+                    self._session_cache.add(session_key)
+                elif response.status_code == 409:
+                    # Session already exists
+                    logger.info(f"ADK session already exists: {session_id}")
+                    self._session_cache.add(session_key)
+                else:
+                    logger.warning(f"Failed to create ADK session: {response.status_code}")
+                    
+        except Exception as e:
+            logger.error(f"Error ensuring ADK session: {e}")
+            # Don't raise here, let the main request continue

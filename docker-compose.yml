@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  adk-middleware:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - ADK_HOST=http://adk-backend:8000
+      - ADK_APP_NAME=default_agent
+      - PORT=8080
+      - LOG_LEVEL=INFO
+      - MAX_FILE_SIZE_MB=20
+      - DOWNLOAD_TIMEOUT=30
+    depends_on:
+      - adk-backend
+    networks:
+      - adk-network
+    restart: unless-stopped
+
+  # This is a placeholder for your actual ADK backend service
+  # Replace with your actual ADK service configuration
+  adk-backend:
+    image: your-adk-backend:latest
+    ports:
+      - "8000:8000"
+    networks:
+      - adk-network
+    restart: unless-stopped
+
+networks:
+  adk-network:
+    driver: bridge
