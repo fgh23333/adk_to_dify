@@ -120,6 +120,24 @@ class ADKClient:
                     adk_response = response.json()
                     return self._convert_from_adk_response(adk_response, request.model)
 
+                # If session not found, invalidate cache and retry once
+                if response.status_code == 404:
+                    logger.warning(f"Session not found on ADK backend, invalidating cache and retrying: {adk_request.sessionId}")
+                    session_key = f"{adk_request._agent_name}:{adk_request.userId}:{adk_request.sessionId}"
+                    self._session_cache.discard(session_key)
+                    await self._ensure_session(adk_request._agent_name, adk_request.userId, adk_request.sessionId, backend_url)
+
+                    # Retry the request
+                    response = await client.post(
+                        f"{backend_url}/run",
+                        json=request_data
+                    )
+                    logger.info(f"ADK retry response status: {response.status_code}")
+
+                    if response.status_code == 200:
+                        adk_response = response.json()
+                        return self._convert_from_adk_response(adk_response, request.model)
+
                 response.raise_for_status()
 
             except httpx.HTTPStatusError as e:
@@ -164,6 +182,33 @@ class ADKClient:
                 ) as response:
                     logger.info(f"ADK SSE response status: {response.status_code}")
 
+                    # If session not found, invalidate cache and retry once
+                    if response.status_code == 404:
+                        logger.warning(f"Session not found on ADK SSE backend, invalidating cache and retrying: {adk_request.sessionId}")
+                        await response.aread()  # consume the response body
+                        session_key = f"{adk_request._agent_name}:{adk_request.userId}:{adk_request.sessionId}"
+                        self._session_cache.discard(session_key)
+                        await self._ensure_session(adk_request._agent_name, adk_request.userId, adk_request.sessionId, backend_url)
+
+                        # Retry the SSE request
+                        async with client.stream(
+                            "POST",
+                            f"{backend_url}/run_sse",
+                            json=request_data,
+                            headers={"Accept": "text/event-stream"}
+                        ) as retry_response:
+                            logger.info(f"ADK SSE retry response status: {retry_response.status_code}")
+                            if retry_response.status_code != 200:
+                                error_body = await retry_response.aread()
+                                logger.error(f"ADK SSE retry error: {retry_response.status_code} - {error_body}")
+                                yield self._create_error_chunk(request.model, f"ADK error: {retry_response.status_code}")
+                                yield "data: [DONE]\n\n"
+                                return
+
+                            async for chunk in self._process_sse_stream(retry_response, request.model, chat_id=f"chatcmpl-{int(time.time())}", sent_content_tracker=sent_content_tracker, tracker_key=tracker_key):
+                                yield chunk
+                            return
+
                     if response.status_code != 200:
                         error_body = await response.aread()
                         logger.error(f"ADK SSE error: {response.status_code} - {error_body}")
@@ -171,45 +216,8 @@ class ADKClient:
                         yield "data: [DONE]\n\n"
                         return
 
-                    chat_id = f"chatcmpl-{int(time.time())}"
-
-                    async for line in response.aiter_lines():
-                        if not line.strip():
-                            continue
-
-                        # Parse SSE line
-                        if line.startswith("data:"):
-                            data_str = line[5:].strip()
-
-                            if data_str == "[DONE]":
-                                yield self._create_final_chunk(chat_id, request.model)
-                                yield "data: [DONE]\n\n"
-                                return
-
-                            try:
-                                event_data = json.loads(data_str)
-                                chunk = self._convert_adk_sse_to_openai(
-                                    event_data,
-                                    request.model,
-                                    chat_id,
-                                    sent_content_tracker[tracker_key]
-                                )
-
-                                if chunk:
-                                    if "choices" in chunk and chunk["choices"]:
-                                        delta = chunk["choices"][0].get("delta", {})
-                                        new_content = delta.get("content", "")
-                                        if new_content:
-                                            sent_content_tracker[tracker_key] += new_content
-
-                                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-
-                            except json.JSONDecodeError:
-                                logger.warning(f"Failed to parse SSE data: {data_str[:100]}")
-                                continue
-
-                    yield self._create_final_chunk(chat_id, request.model)
-                    yield "data: [DONE]\n\n"
+                    async for chunk in self._process_sse_stream(response, request.model, chat_id=f"chatcmpl-{int(time.time())}", sent_content_tracker=sent_content_tracker, tracker_key=tracker_key):
+                        yield chunk
 
             except httpx.TimeoutException:
                 logger.error("ADK SSE timeout")
@@ -219,6 +227,46 @@ class ADKClient:
                 logger.error(f"Error in ADK SSE stream: {e}")
                 yield self._create_error_chunk(request.model, str(e))
                 yield "data: [DONE]\n\n"
+
+    async def _process_sse_stream(self, response, model: str, chat_id: str, sent_content_tracker: dict, tracker_key: str) -> AsyncGenerator[str, None]:
+        """Process an SSE stream response from ADK, yielding OpenAI-formatted chunks."""
+        async for line in response.aiter_lines():
+            if not line.strip():
+                continue
+
+            # Parse SSE line
+            if line.startswith("data:"):
+                data_str = line[5:].strip()
+
+                if data_str == "[DONE]":
+                    yield self._create_final_chunk(chat_id, model)
+                    yield "data: [DONE]\n\n"
+                    return
+
+                try:
+                    event_data = json.loads(data_str)
+                    chunk = self._convert_adk_sse_to_openai(
+                        event_data,
+                        model,
+                        chat_id,
+                        sent_content_tracker[tracker_key]
+                    )
+
+                    if chunk:
+                        if "choices" in chunk and chunk["choices"]:
+                            delta = chunk["choices"][0].get("delta", {})
+                            new_content = delta.get("content", "")
+                            if new_content:
+                                sent_content_tracker[tracker_key] += new_content
+
+                        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+                except json.JSONDecodeError:
+                    logger.warning(f"Failed to parse SSE data: {data_str[:100]}")
+                    continue
+
+        yield self._create_final_chunk(chat_id, model)
+        yield "data: [DONE]\n\n"
 
     def _convert_adk_sse_to_openai(self, adk_event: dict, model: str, chat_id: str, previously_sent: str) -> Optional[dict]:
         """
